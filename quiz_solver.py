@@ -7,7 +7,9 @@ import sys
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from playwright.async_api import async_playwright, Page
-import requests
+from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError
+import httpx
+from bs4 import BeautifulSoup
 from openai import OpenAI
 
 import config
@@ -20,17 +22,30 @@ from prompts import (
 
 logger = logging.getLogger(__name__)
 
+class QuizError(Exception):
+    """Base exception for quiz solving errors."""
+    pass
+
+class NetworkError(QuizError):
+    """Network related errors."""
+    pass
+
+class ExtractionError(QuizError):
+    """Data extraction errors."""
+    pass
+
 class QuizSolver:
     """Solve quiz tasks using browser automation and LLM."""
     
     def __init__(self):
-        # Fix for Windows + Python 3.13 + Playwright async compatibility
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        
         self.client = OpenAI(api_key=config.OPENAI_API_KEY)
         self.data_processor = DataProcessor()
-        self.start_time = None
+        self.start_time: Optional[datetime] = None
+        self.http_client = httpx.AsyncClient(timeout=30.0)
+
+    async def close(self):
+        """Close async resources."""
+        await self.http_client.aclose()
     
     def _is_timeout_exceeded(self) -> bool:
         """Check if 3-minute timeout has been exceeded."""
@@ -81,6 +96,8 @@ class QuizSolver:
                 logger.error(f"Error solving quiz {current_url}: {e}", exc_info=True)
                 break
         
+        await self.close()
+        
         if self._is_timeout_exceeded():
             logger.warning("Quiz chain stopped: timeout exceeded")
         else:
@@ -88,7 +105,7 @@ class QuizSolver:
     
     async def solve_single_quiz(self, quiz_url: str) -> Dict[str, Any]:
         """
-        Solve a single quiz.
+        Solve a single quiz with Playwright and fallback to HTTPX.
         
         Args:
             quiz_url: URL of the quiz
@@ -96,41 +113,75 @@ class QuizSolver:
         Returns:
             Response from submission endpoint
         """
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+        content = ""
+        page = None
+        playwright = None
+        browser = None
+        
+        # Try Playwright first
+        try:
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(headless=True)
             page = await browser.new_page()
             
+            logger.info(f"Loading quiz page with Playwright: {quiz_url}")
+            await page.goto(quiz_url, timeout=config.BROWSER_TIMEOUT_MS)
+            await page.wait_for_load_state("networkidle")
+            
+            # Get rendered HTML content
+            content = await page.content()
+            logger.info(f"Playwright loaded content, length: {len(content)}")
+            
+        except Exception as e:
+            logger.error(f"Playwright failed: {e}. Falling back to HTTPX.")
+            # Fallback to HTTPX
             try:
-                # Navigate to quiz page
-                logger.info(f"Loading quiz page: {quiz_url}")
-                await page.goto(quiz_url, timeout=config.BROWSER_TIMEOUT_MS)
+                response = await self.http_client.get(quiz_url)
+                content = response.text
+                logger.info(f"HTTPX loaded content, length: {len(content)}")
+            except Exception as e2:
+                logger.error(f"Fallback HTTPX failed: {e2}")
+                if browser: await browser.close()
+                if playwright: await playwright.stop()
+                raise NetworkError(f"Failed to load quiz: {e} -> {e2}")
+
+        try:
+            # Extract quiz information using LLM (passing HTML content)
+            quiz_info = self._extract_quiz_info(content)
+            logger.info(f"Extracted quiz info: {quiz_info}")
+            
+            # Solve the quiz
+            answer = await self._solve_quiz(quiz_info, page)
+            logger.info(f"Generated answer: {answer}")
+            
+            # Submit the answer
+            result = await self._submit_answer(
+                quiz_info["submit_url"],
+                quiz_url,
+                answer
+            )
+            
+            return result
+            
+        finally:
+            if browser: await browser.close()
+            if playwright: await playwright.stop()
+                
+    async def _navigate_to_quiz(self, page: Page, url: str) -> None:
+        """Navigate to quiz page with retries."""
+        for attempt in range(config.MAX_RETRIES):
+            try:
+                logger.info(f"Loading quiz page: {url} (Attempt {attempt + 1})")
+                await page.goto(url, timeout=config.BROWSER_TIMEOUT_MS)
                 await page.wait_for_load_state("networkidle")
-                
-                # Get rendered HTML content
-                content = await page.content()
-                text_content = await page.inner_text("body")
-                
-                logger.info(f"Quiz page loaded, content length: {len(text_content)}")
-                
-                # Extract quiz information using LLM
-                quiz_info = self._extract_quiz_info(text_content)
-                logger.info(f"Extracted quiz info: {quiz_info}")
-                
-                # Solve the quiz
-                answer = await self._solve_quiz(quiz_info, page)
-                logger.info(f"Generated answer: {answer}")
-                
-                # Submit the answer
-                result = self._submit_answer(
-                    quiz_info["submit_url"],
-                    quiz_url,
-                    answer
-                )
-                
-                return result
-                
-            finally:
-                await browser.close()
+                return
+            except PlaywrightTimeoutError:
+                logger.warning(f"Timeout loading {url}, retrying...")
+                if attempt == config.MAX_RETRIES - 1:
+                    raise NetworkError(f"Failed to load {url} after retries")
+            except Exception as e:
+                logger.error(f"Navigation error: {e}")
+                raise NetworkError(f"Navigation failed: {e}")
     
     def _extract_quiz_info(self, content: str) -> Dict[str, Any]:
         """
@@ -157,18 +208,29 @@ class QuizSolver:
             logger.info(f"LLM extracted quiz info: {result}")
             return result
             
+        except json.JSONDecodeError:
+            logger.error("Failed to parse LLM response as JSON")
+            raise ExtractionError("Invalid JSON from LLM")
         except Exception as e:
             logger.error(f"Error extracting quiz info: {e}")
             # Fallback: try to extract submit URL manually
             submit_url_match = re.search(r'https://[^\s<>"]+/submit', content)
+            
+            # Fallback: extract question from <div id="result"> or similar if LLM fails
+            question_match = re.search(r'<div id="result">(.*?)</div>', content, re.DOTALL)
+            question = question_match.group(1).strip() if question_match else content[:1000]
+            
+            if not submit_url_match:
+                logger.warning("Could not find submit URL in fallback mode")
+            
             return {
-                "question": content[:500],
+                "question": question,
                 "answer_type": "string",
                 "data_sources": [],
                 "submit_url": submit_url_match.group(0) if submit_url_match else ""
             }
     
-    async def _solve_quiz(self, quiz_info: Dict[str, Any], page: Page) -> Any:
+    async def _solve_quiz(self, quiz_info: Dict[str, Any], page: Optional[Page] = None) -> Any:
         """
         Solve the quiz using LLM to generate and execute code.
         
@@ -239,7 +301,8 @@ class QuizSolver:
         """
         # Create safe execution environment
         safe_globals = {
-            "requests": requests,
+            "requests": requests,  # Keep requests for generated code compatibility if needed, or prefer httpx
+            "httpx": httpx,
             "pd": __import__("pandas"),
             "np": __import__("numpy"),
             "BeautifulSoup": __import__("bs4").BeautifulSoup,
@@ -307,7 +370,9 @@ class QuizSolver:
         elif answer_type == "boolean":
             if isinstance(answer, bool):
                 return answer
-            return str(answer).lower() in ['true', 'yes', '1']
+            if isinstance(answer, str):
+                return answer.lower().strip() in ['true', 'yes', '1']
+            return bool(answer)
         elif answer_type == "json":
             if isinstance(answer, (dict, list)):
                 return answer
@@ -316,11 +381,13 @@ class QuizSolver:
             except:
                 return answer
         else:
+            if isinstance(answer, str):
+                return answer.strip()
             return answer
     
-    def _submit_answer(self, submit_url: str, quiz_url: str, answer: Any) -> Dict[str, Any]:
+    async def _submit_answer(self, submit_url: str, quiz_url: str, answer: Any) -> Dict[str, Any]:
         """
-        Submit answer to the endpoint.
+        Submit answer to the endpoint asynchronously.
         
         Args:
             submit_url: Submission endpoint URL
@@ -338,19 +405,30 @@ class QuizSolver:
         }
         
         logger.info(f"Submitting answer to {submit_url}")
-        logger.info(f"Payload: {json.dumps(payload, indent=2)}")
         
-        try:
-            response = requests.post(
-                submit_url,
-                json=payload,
-                timeout=30
-            )
+        for attempt in range(3):
+            try:
+                response = await self.http_client.post(
+                    submit_url,
+                    json=payload,
+                    timeout=30.0
+                )
+                
+                response.raise_for_status()
+                result = response.json()
+                logger.info(f"Submission response: {result}")
+                return result
+                
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error submitting answer (Attempt {attempt+1}): {e.response.text}")
+                if attempt == 2:
+                    return {"correct": False, "reason": f"HTTP {e.response.status_code}"}
+            except Exception as e:
+                logger.error(f"Error submitting answer (Attempt {attempt+1}): {e}")
+                if attempt == 2:
+                    return {"correct": False, "reason": str(e)}
             
-            result = response.json()
-            logger.info(f"Submission response: {result}")
-            return result
+            # Wait before retry
+            await asyncio.sleep(1)
             
-        except Exception as e:
-            logger.error(f"Error submitting answer: {e}")
-            return {"correct": False, "reason": str(e)}
+        return {"correct": False, "reason": "Submission failed after retries"}

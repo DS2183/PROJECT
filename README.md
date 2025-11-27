@@ -13,6 +13,18 @@ This application:
 
 ## 🏗️ Architecture
 
+```mermaid
+flowchart TD
+  API[FastAPI Server] -->|Trigger| Solver[Quiz Solver]
+  Solver -->|Fetch Page| Playwright[Playwright Browser]
+  Solver -->|Fallback| HTTPX[HTTPX Client]
+  Solver -->|Extract Info| LLM[OpenAI GPT-4]
+  Solver -->|Generate Code| LLM
+  Solver -->|Execute Code| Sandbox[Code Execution]
+  Solver -->|Submit Answer| Endpoint[Submission API]
+  Endpoint -->|Next URL| Solver
+```
+
 ### Components
 
 1. **FastAPI Server** (`app.py`)

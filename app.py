@@ -1,9 +1,16 @@
 """FastAPI application for LLM Analysis Quiz endpoint."""
+import sys
 import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+# Fix for Windows + Playwright: Enforce ProactorEventLoopPolicy
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, ValidationError
-import logging
 
 import config
 from quiz_solver import QuizSolver
@@ -15,11 +22,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle manager for the app."""
+    # Startup
+    try:
+        config.validate_config()
+        logger.info("Configuration validated successfully")
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down application...")
+
 # Initialize FastAPI app
 app = FastAPI(
     title="LLM Analysis Quiz API",
     description="API endpoint for solving data analysis quizzes",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Request model
@@ -32,16 +66,6 @@ class QuizRequest(BaseModel):
 class QuizResponse(BaseModel):
     status: str
     message: str
-
-@app.on_event("startup")
-async def startup_event():
-    """Validate configuration on startup."""
-    try:
-        config.validate_config()
-        logger.info("Configuration validated successfully")
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
-        raise
 
 @app.post("/quiz", response_model=QuizResponse)
 async def handle_quiz(request: Request):
@@ -103,12 +127,16 @@ async def solve_quiz_async(quiz_url: str):
     Args:
         quiz_url: URL of the quiz to solve
     """
+    solver = None
     try:
         solver = QuizSolver()
         await solver.solve_quiz_chain(quiz_url)
         logger.info(f"Successfully completed quiz chain starting from {quiz_url}")
     except Exception as e:
         logger.error(f"Error solving quiz {quiz_url}: {e}", exc_info=True)
+    finally:
+        if solver:
+            await solver.close()
 
 @app.exception_handler(ValidationError)
 async def validation_exception_handler(request: Request, exc: ValidationError):

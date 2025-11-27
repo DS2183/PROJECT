@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 import requests
+import httpx
 from bs4 import BeautifulSoup
 import pandas as pd
 from pypdf import PdfReader
@@ -23,6 +24,11 @@ class DataProcessor:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
+        self.async_client = httpx.AsyncClient(headers=self.session.headers, timeout=30.0)
+
+    async def close(self):
+        """Close async resources."""
+        await self.async_client.aclose()
     
     def download_file(self, url: str, headers: Optional[Dict] = None) -> bytes:
         """
@@ -37,6 +43,13 @@ class DataProcessor:
         """
         logger.info(f"Downloading file from {url}")
         response = self.session.get(url, headers=headers or {}, timeout=30)
+        response.raise_for_status()
+        return response.content
+
+    async def download_file_async(self, url: str, headers: Optional[Dict] = None) -> bytes:
+        """Async version of download_file."""
+        logger.info(f"Downloading file async from {url}")
+        response = await self.async_client.get(url, headers=headers or {})
         response.raise_for_status()
         return response.content
     
@@ -62,32 +75,55 @@ class DataProcessor:
             script.decompose()
         
         return soup.get_text(separator=' ', strip=True)
+
+    async def scrape_website_async(self, url: str, headers: Optional[Dict] = None) -> str:
+        """Async version of scrape_website."""
+        logger.info(f"Scraping website async {url}")
+        response = await self.async_client.get(url, headers=headers or {})
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        for script in soup(["script", "style"]):
+            script.decompose()
+            
+        return soup.get_text(separator=' ', strip=True)
     
-    def parse_pdf(self, content: bytes) -> str:
+    def parse_pdf(self, content: bytes, page: Optional[int] = None) -> str:
         """
         Extract text from PDF content.
         
         Args:
-            content: PDF file content as bytes
+            content: PDF file content
+            page: Optional page number (0-indexed) to extract from
             
         Returns:
             Extracted text
         """
-        logger.info("Parsing PDF content")
-        pdf_file = io.BytesIO(content)
-        pdf_reader = PdfReader(pdf_file)
+        logger.info(f"Parsing PDF content, page: {page}")
+        reader = PdfReader(io.BytesIO(content))
         
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
+        if page is not None:
+            if 0 <= page < len(reader.pages):
+                return reader.pages[page].extract_text()
+            else:
+                logger.warning(f"Page {page} out of range (0-{len(reader.pages)-1})")
+                return ""
         
-        return text
-    
+        return "\n".join([p.extract_text() for p in reader.pages])
+
     def parse_csv(self, content: bytes) -> pd.DataFrame:
-        """Parse CSV content into DataFrame."""
+        """
+        Parse CSV content into DataFrame.
+        
+        Args:
+            content: CSV file content
+            
+        Returns:
+            DataFrame
+        """
         logger.info("Parsing CSV content")
         return pd.read_csv(io.BytesIO(content))
-    
+
     def parse_excel(self, content: bytes, sheet_name: Union[str, int] = 0) -> pd.DataFrame:
         """Parse Excel content into DataFrame."""
         logger.info(f"Parsing Excel content, sheet: {sheet_name}")
@@ -121,28 +157,37 @@ class DataProcessor:
         """
         logger.info(f"Creating {chart_type} chart")
         
+        if data.empty:
+            logger.warning("Empty dataframe, cannot create chart")
+            return ""
+            
         fig, ax = plt.subplots(figsize=(10, 6))
         
-        if chart_type == "bar":
-            data.plot(kind='bar', x=x_col, y=y_col, ax=ax)
-        elif chart_type == "line":
-            data.plot(kind='line', x=x_col, y=y_col, ax=ax)
-        elif chart_type == "scatter":
-            data.plot(kind='scatter', x=x_col, y=y_col, ax=ax)
-        elif chart_type == "pie":
-            data.plot(kind='pie', y=y_col, ax=ax)
-        
-        ax.set_title(title)
-        plt.tight_layout()
-        
-        # Convert to base64
-        buffer = io.BytesIO()
-        plt.savefig(buffer, format='png', dpi=150)
-        buffer.seek(0)
-        image_base64 = base64.b64encode(buffer.read()).decode()
-        plt.close()
-        
-        return f"data:image/png;base64,{image_base64}"
+        try:
+            if chart_type == "bar":
+                data.plot(kind='bar', x=x_col, y=y_col, ax=ax)
+            elif chart_type == "line":
+                data.plot(kind='line', x=x_col, y=y_col, ax=ax)
+            elif chart_type == "scatter":
+                data.plot(kind='scatter', x=x_col, y=y_col, ax=ax)
+            elif chart_type == "pie":
+                data.plot(kind='pie', y=y_col, ax=ax)
+            
+            ax.set_title(title)
+            plt.tight_layout()
+            
+            # Convert to base64
+            buffer = io.BytesIO()
+            plt.savefig(buffer, format='png', dpi=150)
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.read()).decode()
+            plt.close()
+            
+            return f"data:image/png;base64,{image_base64}"
+        except Exception as e:
+            logger.error(f"Error creating chart: {e}")
+            plt.close()
+            return ""
     
     def create_plotly_chart(
         self,
