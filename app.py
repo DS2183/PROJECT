@@ -130,6 +130,15 @@ async def handle_quiz(request: Request):
         message=f"Quiz request accepted. Solving quiz at {url}"
     )
 
+# Alias /solve to /quiz for project submission requirements
+@app.post("/solve", response_model=QuizResponse)
+async def handle_solve(request: Request):
+    """
+    Alias for /quiz endpoint to match project requirements.
+    Accepts the same payload and behaves identically.
+    """
+    return await handle_quiz(request)
+
 async def solve_quiz_async(quiz_url: str):
     """
     Solve the quiz asynchronously.
