@@ -10,8 +10,10 @@ STUDENT_EMAIL = os.getenv("STUDENT_EMAIL", "")
 STUDENT_SECRET = os.getenv("STUDENT_SECRET", "")
 
 # OpenAI Configuration
+# OpenAI Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = "gpt-4-turbo-preview"  # Using GPT-4 for complex reasoning
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_MODEL = "gpt-4o-mini"  # Using GPT-4o-mini for better availability and speed
 
 # Server Configuration
 HOST = os.getenv("HOST", "0.0.0.0")

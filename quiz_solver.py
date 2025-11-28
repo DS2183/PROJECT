@@ -55,7 +55,10 @@ class QuizSolver:
     """Solve quiz tasks using browser automation and LLM."""
     
     def __init__(self):
-        self.client = OpenAI(api_key=config.OPENAI_API_KEY)
+        self.client = OpenAI(
+            api_key=config.OPENAI_API_KEY,
+            base_url=config.OPENAI_BASE_URL
+        )
         self.data_processor = DataProcessor()
         self.start_time: Optional[datetime] = None
         self.http_client = httpx.AsyncClient(timeout=30.0)
